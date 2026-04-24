@@ -1,0 +1,265 @@
+name: Bootstrap TEAM Application (First Deployment)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: team-bootstrap-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  MANAGEMENT_ACCOUNT: ${{ vars.MANAGEMENT_ACCOUNT }}
+  TEAM_ACCOUNT: ${{ vars.TEAM_ACCOUNT }}
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (Role A via OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.MANAGEMENT_ACCOUNT }}:role/GitHubActions-TEAM-RoleA
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Generate parameters.sh
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd deployment
+          cat > parameters.sh <<'EOF'
+          IDC_LOGIN_URL="${{ vars.IDC_LOGIN_URL }}"
+          REGION="${{ vars.AWS_REGION }}"
+          TEAM_ACCOUNT="${{ vars.TEAM_ACCOUNT }}"
+          ORG_MASTER_PROFILE=""
+          TEAM_ACCOUNT_PROFILE=""
+          TEAM_ADMIN_GROUP="${{ vars.TEAM_ADMIN_GROUP }}"
+          TEAM_AUDITOR_GROUP="${{ vars.TEAM_AUDITOR_GROUP }}"
+          TAGS="${{ vars.TAGS }}"
+          CLOUDTRAIL_AUDIT_LOGS="${{ vars.CLOUDTRAIL_AUDIT_LOGS }}"
+          UI_DOMAIN="${{ vars.UI_DOMAIN }}"
+          SECRET_NAME="${{ vars.SECRET_NAME }}"
+          CACHE_TTL=604800
+          EOF
+
+      - name: Run init.sh (delegated admin setup)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' init.sh
+          chmod +x init.sh
+          ./init.sh
+
+      - name: Configure AWS credentials (Role B via role chaining)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TEAM_ROLE_B_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-chaining: true
+          role-skip-session-tagging: true
+
+      - name: Install git-remote-codecommit
+        shell: bash
+        run: |
+          set -euo pipefail
+          pipx install git-remote-codecommit
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure CodeCommit repository exists (idempotent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws codecommit get-repository --repository-name team-idc-app --region "${AWS_REGION}" >/dev/null 2>&1 \
+            || aws codecommit create-repository --repository-name team-idc-app --region "${AWS_REGION}" >/dev/null
+
+      - name: Push GitHub main to CodeCommit (safe mirror)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "GitHub Actions"
+      
+          # Empty CodeCommit repos often default to 'master' with no 'main' — so create 'main' explicitly
+          git clone "codecommit::${AWS_REGION}://team-idc-app" team-idc-mirror
+          cd team-idc-mirror
+      
+          git remote add github "https://github.com/${{ github.repository }}.git" 2>/dev/null || true
+          git fetch github
+      
+          # Ensure local 'main' exists and matches GitHub main
+          git checkout -B main "refs/remotes/github/main"
+      
+          git push -u --force origin refs/heads/main:refs/heads/main
+
+      - name: Patch deploy.sh for CI (disable AWS_PROFILE / CodeCommit)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd deployment
+          sed -i 's/^[[:space:]]*export[[:space:]]\+AWS_PROFILE=.*/unset AWS_PROFILE/' deploy.sh
+          sed -i '/aws codecommit create-repository/ s/^/#/' deploy.sh
+          sed -i '/git remote remove origin/ s/^/#/' deploy.sh
+          sed -i '/git remote add origin/ s/^/#/' deploy.sh
+          sed -i '/git push origin main/ s/^/#/' deploy.sh
+
+      - name: Deploy CloudFormation stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd deployment
+          chmod +x deploy.sh
+          ./deploy.sh
+
+      - name: Wait for CloudFormation to settle (no hang on no-op)
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(aws cloudformation describe-stacks \
+            --stack-name TEAM-IDC-APP \
+            --region "${AWS_REGION}" \
+            --query "Stacks[0].StackStatus" --output text)"
+          echo "Current stack status: ${status}"
+          case "${status}" in
+            *_IN_PROGRESS)
+              aws cloudformation wait stack-update-complete --stack-name TEAM-IDC-APP --region "${AWS_REGION}" \
+                || aws cloudformation wait stack-create-complete --stack-name TEAM-IDC-APP --region "${AWS_REGION}"
+              ;;
+            *_COMPLETE)
+              echo "Stack already complete: ${status}"
+              ;;
+            *)
+              echo "Stack in failure/unknown terminal state: ${status}"
+              aws cloudformation describe-stack-events \
+                --stack-name TEAM-IDC-APP \
+                --region "${AWS_REGION}" \
+                --max-items 30 \
+                --query "StackEvents[].[Timestamp,LogicalResourceId,ResourceType,ResourceStatus,ResourceStatusReason]" \
+                --output table
+              exit 1
+              ;;
+          esac
+
+      - name: Wait for Amplify build to finish (and surface logs)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_ID="$(aws amplify list-apps \
+            --region "${AWS_REGION}" \
+            --query "apps[?name=='TEAM-IDC-APP'].appId | [0]" \
+            --output text)"
+          [[ -n "${APP_ID}" && "${APP_ID}" != "None" ]] || { echo "Amplify AppId not found"; exit 1; }
+
+          JOB_ID="$(aws amplify list-jobs --app-id "${APP_ID}" --branch-name main --max-items 1 --region "${AWS_REGION}" --output json \
+            | jq -r '.jobSummaries[0].jobId // empty')"
+          [[ -n "${JOB_ID}" ]] || { echo "Amplify jobId not found"; exit 1; }
+          [[ "${JOB_ID}" =~ ^[0-9]+$ ]] || { echo "Invalid jobId: '${JOB_ID}'"; exit 1; }
+
+          echo "Tracking Amplify jobId=${JOB_ID} for appId=${APP_ID}"
+
+          deadline=$((SECONDS+3600))
+          while (( SECONDS < deadline )); do
+            job="$(aws amplify get-job --app-id "${APP_ID}" --branch-name main --job-id "${JOB_ID}" --region "${AWS_REGION}" --output json)"
+            status="$(jq -r '.job.summary.status // "UNKNOWN"' <<< "${job}")"
+            reason="$(jq -r '.job.steps[]? | select(.stepName=="BUILD") | .statusReason // empty' <<< "${job}" | head -n 1)"
+            buildLogUrl="$(jq -r '.job.steps[]? | select(.stepName=="BUILD") | .logUrl // empty' <<< "${job}" | head -n 1)"
+
+            echo "Amplify job ${JOB_ID} status=${status}"
+            aws amplify get-job --app-id "${APP_ID}" --branch-name main --job-id "${JOB_ID}" --region "${AWS_REGION}" \
+              --query "job.steps[].{name:stepName,status:status,start:startTime,end:endTime,statusReason:statusReason}" --output table || true
+
+            case "${status}" in
+              SUCCEED) break ;;
+              FAILED|CANCELLED)
+                echo "Amplify job failed: ${status}"
+                [[ -n "${reason}" ]] && echo "BUILD statusReason: ${reason}"
+                [[ -n "${buildLogUrl}" ]] && echo "BUILD logUrl: ${buildLogUrl}"
+                exit 1
+                ;;
+              *) sleep 20 ;;
+            esac
+          done
+
+          if (( SECONDS >= deadline )); then
+            echo "Timed out waiting for Amplify job ${JOB_ID} to finish."
+            exit 1
+          fi
+
+      - name: Output SAML parameters for IAM Identity Center app (copy/paste)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEFAULT_DOMAIN="$(aws cloudformation describe-stacks --stack-name TEAM-IDC-APP --region "${AWS_REGION}" \
+            --query "Stacks[0].Outputs[?OutputKey=='DefaultDomain'].OutputValue | [0]" --output text)"
+          [[ -n "${DEFAULT_DOMAIN}" && "${DEFAULT_DOMAIN}" != "None" ]] || { echo "DefaultDomain not found"; exit 1; }
+
+          USER_POOL_ID="$(aws cognito-idp list-user-pools \
+            --max-results 60 \
+            --region "${AWS_REGION}" \
+            --query "UserPools[?contains(Name, 'team06dbb7fc')].Id | [0]" \
+            --output text)"
+          [[ -n "${USER_POOL_ID}" && "${USER_POOL_ID}" != "None" ]] || { echo "UserPoolId not found via list-user-pools"; exit 1; }
+
+          COGNITO_DOMAIN="$(aws cognito-idp describe-user-pool --user-pool-id "${USER_POOL_ID}" --region "${AWS_REGION}" --query "UserPool.Domain" --output text)"
+          [[ -n "${COGNITO_DOMAIN}" && "${COGNITO_DOMAIN}" != "None" ]] || { echo "Cognito domain missing on user pool"; exit 1; }
+
+          CLIENT_ID="$(aws cognito-idp list-user-pool-clients --user-pool-id "${USER_POOL_ID}" --region "${AWS_REGION}" \
+            --query "UserPoolClients[?contains(ClientName, 'clientWeb')].ClientId | [0]" --output text)"
+          [[ -n "${CLIENT_ID}" && "${CLIENT_ID}" != "None" ]] || { echo "clientWeb client not found"; exit 1; }
+
+          REDIRECT_URI="https://main.${DEFAULT_DOMAIN}/"
+          START_URL="https://${COGNITO_DOMAIN}.auth.${AWS_REGION}.amazoncognito.com/authorize?client_id=${CLIENT_ID}&response_type=code&scope=aws.cognito.signin.user.admin+email+openid+phone+profile&redirect_uri=${REDIRECT_URI}&idp_identifier=team"
+          ACS_URL="https://${COGNITO_DOMAIN}.auth.${AWS_REGION}.amazoncognito.com/saml2/idpresponse"
+          AUDIENCE="urn:amazon:cognito:sp:${USER_POOL_ID}"
+
+          echo "================================================"
+          echo "IAM Identity Center Custom SAML 2.0 app values"
+          echo "Application start URL: ${START_URL}"
+          echo "Application ACS URL:   ${ACS_URL}"
+          echo "Application SAML audience: ${AUDIENCE}"
+          echo ""
+          echo "Attribute mappings:"
+          echo "  Subject -> \${user:subject} (persistent)"
+          echo "  Email   -> \${user:email} (basic)"
+          echo "================================================"
+          echo ""
+          echo "Next: create the IdC Custom SAML app with those values,"
+          echo "then set GitHub variable SAML_METADATA_URL to the IdC app metadata URL,"
+          echo "then run update-team.yml to configure Cognito + client."
+          echo "================================================"
+
+      - name: Verify TEAM URL is reachable and sane
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_URL="$(aws amplify list-apps \
+            --region "${AWS_REGION}" \
+            --query "apps[?name=='TEAM-IDC-APP'].defaultDomain | [0]" \
+            --output text)"
+          [[ -n "${APP_URL}" && "${APP_URL}" != "None" ]] || { echo "Could not determine app URL"; exit 1; }
+          URL="https://main.${APP_URL}/"
+          echo "Checking ${URL}"
+          deadline=$((SECONDS+600))
+          while (( SECONDS < deadline )); do
+            body="$(curl -fsSL "${URL}" || true)"
+            if [[ -n "${body}" ]] && grep -qiE "TEAM|aws-amplify|<html" <<< "${body}"; then
+              echo "TEAM front-end appears online."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Front-end did not become ready at ${URL}"
+          exit 1
